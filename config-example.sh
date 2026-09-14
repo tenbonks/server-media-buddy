@@ -12,3 +12,6 @@ COMICS_DEST="/mnt/media/Media/Comics/"
 FILMS_SRC_DEFAULT="$HOME/Downloads/to_upload_films/"
 TV_SRC_DEFAULT="$HOME/Downloads/to_upload_series/"
 COMICS_SRC_DEFAULT="$HOME/Downloads/to_upload_comics/"
+
+# TMDB API key (v3 auth) for jellyfin-renamer.sh — free at themoviedb.org → Settings → API
+TMDB_API_KEY=""

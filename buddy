@@ -1,0 +1,190 @@
+#!/bin/bash
+# Media Server Buddy — single entry point for the upload and rename scripts.
+# Usage:
+#   ./buddy                       # interactive menu
+#   ./buddy films  [folder]       # same as ./upload-films.sh
+#   ./buddy tv     [folder]       # same as ./upload-tv.sh
+#   ./buddy comics [folder]       # same as ./upload-comics.sh
+#   ./buddy rename [-n] <folder>  # same as ./jellyfin-renamer.sh
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# Colours (only when stdout is a terminal)
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]] && command -v tput >/dev/null && [[ $(tput colors 2>/dev/null || echo 0) -ge 8 ]]; then
+  C_CYAN="$(tput setaf 6)" C_GREEN="$(tput setaf 2)" C_YELLOW="$(tput setaf 3)"
+  C_RED="$(tput setaf 1)" C_DIM="$(tput dim)" C_BOLD="$(tput bold)" C_OFF="$(tput sgr0)"
+else
+  C_CYAN="" C_GREEN="" C_YELLOW="" C_RED="" C_DIM="" C_BOLD="" C_OFF=""
+fi
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+if [[ ! -f "$DIR/config.sh" ]]; then
+  echo "${C_RED}Error:${C_OFF} config.sh not found." >&2
+  echo "  cp config-example.sh config.sh   # then edit it" >&2
+  exit 1
+fi
+source "$DIR/config.sh"
+TMDB_API_KEY="${TMDB_API_KEY:-}"
+
+# ---------------------------------------------------------------------------
+# Drawing helpers
+# ---------------------------------------------------------------------------
+W=62  # inner width of the boxes
+
+banner() {
+  printf '%s' "$C_CYAN"
+  cat <<'EOF'
+ __  __  ___  ___   ___    _      ___  _   _  ___   ___  __   __
+|  \/  || __||   \ |_ _|  /_\    | _ )| | | ||   \ |   \ \ \ / /
+| |\/| || _| | |) | | |  / _ \   | _ \| |_| || |) || |) | \ V /
+|_|  |_||___||___/ |___|/_/ \_\  |___/ \___/ |___/ |___/   |_|
+EOF
+  printf '%s%s          S E R V E R   B U D D Y   ·   Jellyfin + Komga%s\n\n' "$C_OFF" "$C_DIM" "$C_OFF"
+}
+
+# box_top "title"  /  box_row "text"  /  box_bottom
+rule() { local r; printf -v r '%*s' "$1" ''; printf '%s' "${r// /─}"; }  # n box-drawing dashes
+box_top() {
+  local title=" $1 "
+  printf ' ┌─%s%s┐\n' "$title" "$(rule $((W - ${#title})))"
+}
+box_row() { printf ' │ %-*s │\n' "$W" "$1"; }
+box_bottom() { printf ' └%s┘\n' "$(rule $((W + 2)))"; }
+
+# Trim a path to fit in the box, keeping the tail.
+fit() {
+  local s="$1" max="$2"
+  (( ${#s} <= max )) && { printf '%s' "$s"; return; }
+  printf '…%s' "${s: -$((max - 1))}"
+}
+
+status_box() {
+  local key_state
+  if [[ -n "$TMDB_API_KEY" ]]; then key_state="set"; else key_state="MISSING (rename disabled)"; fi
+  box_top "setup"
+  box_row "$(printf 'server    %s' "$SERVER")"
+  box_row "$(printf 'films     %s' "$(fit "$FILMS_SRC_DEFAULT" $((W - 10)))")"
+  box_row "$(printf 'tv        %s' "$(fit "$TV_SRC_DEFAULT" $((W - 10)))")"
+  box_row "$(printf 'comics    %s' "$(fit "$COMICS_SRC_DEFAULT" $((W - 10)))")"
+  box_row "$(printf 'tmdb key  %s' "$key_state")"
+  box_bottom
+  echo
+}
+
+menu_box() {
+  box_top "what do you want to do?"
+  box_row ""
+  box_row "  1   Upload films     ->  $(fit "$FILMS_DEST" $((W - 27)))"
+  box_row "  2   Upload TV        ->  $(fit "$TV_DEST" $((W - 27)))"
+  box_row "  3   Upload comics    ->  $(fit "$COMICS_DEST" $((W - 27)))"
+  box_row ""
+  box_row "  4   Rename for Jellyfin (TMDB lookup, in place)"
+  box_row "  5   Rename dry run   (show the plan, change nothing)"
+  box_row ""
+  box_row "  q   Quit"
+  box_row ""
+  box_bottom
+  echo
+}
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+ask_folder() {  # prompt, default -> echoes chosen folder
+  local prompt="$1" default="${2:-}" ans
+  if [[ -n "$default" ]]; then
+    read -rp "$prompt [${default}]: " ans </dev/tty
+    printf '%s' "${ans:-$default}"
+  else
+    read -rp "$prompt: " ans </dev/tty
+    printf '%s' "$ans"
+  fi
+}
+
+run_step() {  # runs a command, reports pass/fail, returns its status without exiting the menu
+  local rc=0
+  echo
+  "$@" || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    echo "${C_GREEN}✓ finished${C_OFF}"
+  else
+    echo "${C_RED}✗ exited with status $rc${C_OFF}"
+  fi
+  return $rc
+}
+
+do_upload() {  # kind(films|tv|comics), optional folder
+  local kind="$1" folder="${2:-}" default
+  case "$kind" in
+    films)  default="$FILMS_SRC_DEFAULT" ;;
+    tv)     default="$TV_SRC_DEFAULT" ;;
+    comics) default="$COMICS_SRC_DEFAULT" ;;
+  esac
+  [[ -z "$folder" ]] && folder="$(ask_folder "Folder to upload" "$default")"
+  run_step "$DIR/upload-$kind.sh" "$folder"
+}
+
+do_rename() {  # [-n], optional folder
+  local args=() folder="" a
+  for a in "$@"; do
+    if [[ "$a" == -n || "$a" == --dry-run ]]; then args+=("$a"); else folder="$a"; fi
+  done
+  if [[ -z "$TMDB_API_KEY" ]]; then
+    echo "${C_YELLOW}TMDB_API_KEY is not set in config.sh — get a free key at themoviedb.org → Settings → API.${C_OFF}"
+    return 1
+  fi
+  if [[ -z "$folder" ]]; then
+    echo "  1  films   $FILMS_SRC_DEFAULT"
+    echo "  2  tv      $TV_SRC_DEFAULT"
+    echo "  3  other"
+    read -rp "Which folder? [1/2/3]: " a </dev/tty
+    case "$a" in
+      1) folder="$FILMS_SRC_DEFAULT" ;;
+      2) folder="$TV_SRC_DEFAULT" ;;
+      *) folder="$(ask_folder "Folder to rename")" ;;
+    esac
+  fi
+  run_step "$DIR/jellyfin-renamer.sh" "${args[@]}" "$folder"
+}
+
+# ---------------------------------------------------------------------------
+# Non-interactive subcommands
+# ---------------------------------------------------------------------------
+if [[ $# -gt 0 ]]; then
+  cmd="$1"; shift
+  case "$cmd" in
+    films|tv|comics) do_upload "$cmd" "$@" ;;
+    rename)          do_rename "$@" ;;
+    -h|--help|help)  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) echo "Unknown command: $cmd" >&2; sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+  esac
+  exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# Interactive menu
+# ---------------------------------------------------------------------------
+while true; do
+  clear
+  banner
+  status_box
+  menu_box
+  read -rp " ${C_BOLD}choice:${C_OFF} " choice </dev/tty
+  echo
+  case "$choice" in
+    1) do_upload films || true ;;
+    2) do_upload tv || true ;;
+    3) do_upload comics || true ;;
+    4) do_rename || true ;;
+    5) do_rename -n || true ;;
+    q|Q) echo "Bye."; exit 0 ;;
+    *) continue ;;
+  esac
+  echo
+  read -rp " ${C_DIM}press enter to return to the menu${C_OFF} " _ </dev/tty
+done
